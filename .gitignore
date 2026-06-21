@@ -1,0 +1,32 @@
+.DS_Store
+
+.cache/
+node_modules/
+.tmp/
+
+npm-debug.log
+yarn-error.log
+
+dist/
+dev/
+
+*.tgz
+coverage/
+
+.vscode
+.idea
+
+docs-build/
+
+**/.metro-health-check*
+
+# windows
+msbuild.binlog
+
+# Yarn
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions

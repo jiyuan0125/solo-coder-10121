@@ -1,0 +1,18 @@
+module.exports = {
+  verbose: true,
+  bail: true,
+  moduleNameMapper: {},
+  setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.js'],
+  rootDir: __dirname,
+  modulePaths: ['<rootDir>/src'],
+  moduleDirectories: ['<rootDir>/node_modules'],
+  restoreMocks: true,
+  testMatch: ['**/__tests__/**/?(spec|test).js', '**/?(*.)(spec|test).js'],
+  moduleFileExtensions: ['js'],
+  modulePathIgnorePatterns: ['<rootDir>/dist', '<rootDir>/dev'],
+  // collectCoverage: true,
+  // collectCoverageFrom: ['!**/node_modules/**', 'src/**'],
+  // coverageDirectory: 'coverage',
+  // coverageReporters: ['html', 'json'],
+  cacheDirectory: '.cache/jest',
+}
