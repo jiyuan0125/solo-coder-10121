@@ -53,12 +53,11 @@ export default function markLocalChangesAsSynced(
   rejectedIds?: ?SyncRejectedIds,
 ): Promise<void> {
   return db.write(async () => {
-    // update and destroy records concurrently
-    await Promise.all([
-      db.batch(
-        recordsToMarkAsSynced(syncedLocalChanges, rejectedIds || {}).map(prepareMarkAsSynced),
-      ),
-      ...destroyDeletedRecords(db, syncedLocalChanges, rejectedIds || {}),
-    ])
+    // Must destroy deleted records BEFORE marking records as synced (serialized, not parallel)
+    // Otherwise a race condition can cause inconsistent state
+    await Promise.all(destroyDeletedRecords(db, syncedLocalChanges, rejectedIds || {}))
+    await db.batch(
+      recordsToMarkAsSynced(syncedLocalChanges, rejectedIds || {}).map(prepareMarkAsSynced),
+    )
   }, 'sync-markLocalChangesAsSynced')
 }

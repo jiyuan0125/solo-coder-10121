@@ -100,6 +100,15 @@ export default class WorkQueue {
 
   _subActionIncoming: boolean = false
 
+  _inSynchronousAction: boolean = false
+
+  _workExecutionDepth: number = 0
+
+  // Set to true only when we're about to execute work function body (and not yet returned)
+  // This precisely marks code that is running inside a work function, as opposed to
+  // external code that happens to run while a work item is pending in the queue
+  _insideWorkExecution: boolean = false
+
   constructor(db: Database): void {
     this._db = db
   }
@@ -119,9 +128,78 @@ export default class WorkQueue {
       this._subActionIncoming = false
       const currentWork = this._queue[0]
       if (!currentWork.isWriter) {
-        invariant(!isWriter, 'Cannot call a writer block from a reader block')
+        invariant(
+          !isWriter,
+          'Cannot call a writer block from a reader block. ' +
+            'Use reader.callReader() to call another reader from within a reader. ' +
+            'See docs for more details.',
+        )
       }
-      return work(actionInterface(this, currentWork))
+      // Track execution depth for nested subActions as well
+      this._workExecutionDepth += 1
+      const wasInsideWorkExecution = this._insideWorkExecution
+      this._insideWorkExecution = true
+      try {
+        const result = work(actionInterface(this, currentWork))
+        if (result instanceof Promise) {
+          return result.finally(() => {
+            this._workExecutionDepth -= 1
+            if (this._workExecutionDepth === 0) {
+              this._insideWorkExecution = false
+            }
+          })
+        }
+        this._workExecutionDepth -= 1
+        if (this._workExecutionDepth === 0) {
+          this._insideWorkExecution = wasInsideWorkExecution
+        }
+        return result
+      } catch (error) {
+        this._workExecutionDepth -= 1
+        if (this._workExecutionDepth === 0) {
+          this._insideWorkExecution = wasInsideWorkExecution
+        }
+        throw error
+      }
+    }
+
+    // Detect potentially illegal nested writer/reader calls that happened after an await boundary
+    // _insideWorkExecution means we're currently executing code inside a work() function
+    // (synchronous or async phase)
+    // !_inSynchronousAction means we've already passed the initial synchronous phase
+    // (i.e. there was an await somewhere inside the work function).
+    // Together this MIGHT mean: someone called db.write/db.read AFTER awaiting something inside
+    // a writer/reader without using callWriter/callReader. This causes deadlocks or crashes.
+    // However, this condition can also trigger for LEGAL external calls that happen to run
+    // in the same tick while a work item is pending, so we warn instead of throwing.
+    // The definitive check is in subAction() which tracks _subActionIncoming synchronously.
+    // Synchronous nested calls (without await in between) are always allowed.
+    // Also skip check if database is being reset.
+    if (
+      process.env.NODE_ENV !== 'production' &&
+      this._insideWorkExecution &&
+      !this._inSynchronousAction &&
+      !this._db._isBeingReset
+    ) {
+      const currentWork = this._queue[0]
+      const currentKind = currentWork && currentWork.isWriter ? 'writer' : 'reader'
+      const enqueuedKind = isWriter ? 'writer' : 'reader'
+      const description = currentWork ? currentWork.description || 'unnamed' : 'unnamed'
+      logger.warn(
+        `Potentially illegal nested ${enqueuedKind} call detected! ` +
+          `You are trying to call a ${enqueuedKind} while a ${currentKind} ` +
+          `(${description}) is already running. ` +
+          `If this call happened AFTER awaiting an async operation inside the running ${currentKind}, ` +
+          `this WILL cause deadlocks or crashes. ` +
+          `Use writer.callWriter() or reader.callReader() to safely nest readers/writers. ` +
+          `If this call happened from OUTSIDE any reader/writer (external code), ` +
+          `this is just a warning - the call will be queued normally. ` +
+          `See docs for more details.`,
+      )
+      logger.log(`Enqueued ${enqueuedKind}:`, work)
+      if (currentWork) {
+        logger.log(`Running ${currentKind}:`, currentWork.work)
+      }
     }
 
     return new Promise((resolve, reject) => {
@@ -165,7 +243,11 @@ export default class WorkQueue {
       const promise = work()
       invariant(
         !this._subActionIncoming,
-        'callReader/callWriter call must call a reader/writer synchronously',
+        'callReader/callWriter call must call a reader/writer synchronously. ' +
+          'You cannot await an async operation before calling the nested reader/writer. ' +
+          'If you need to do async work before the nested call, perform it before calling callReader/callWriter, ' +
+          'or restructure your code to call the nested reader/writer synchronously. ' +
+          'See docs for more details.',
       )
       return promise
     } catch (error) {
@@ -178,8 +260,30 @@ export default class WorkQueue {
     const workItem = this._queue[0]
     const { work, resolve, reject, isWriter } = workItem
 
+    let workPromise
+    let result
+    let caughtError
     try {
-      const workPromise = work(actionInterface(this, workItem))
+      // Mark that we're in the synchronous execution phase of a work item
+      // This is used to detect illegal nested writer/reader calls
+      // Only set if not already set (i.e. we're the top-level work, not a subAction)
+      const wasInSynchronousAction = this._inSynchronousAction
+      if (!wasInSynchronousAction) {
+        this._inSynchronousAction = true
+      }
+      // Increment work execution depth (including for subActions)
+      // This tracks whether we're inside any work() function at all
+      this._workExecutionDepth += 1
+      // Mark that we're about to execute inside a work function body
+      // This is used together with _inSynchronousAction to detect illegal nested calls
+      this._insideWorkExecution = true
+      if (process.env.NODE_ENV !== 'production' && isWriter && !wasInSynchronousAction) {
+        this._db._preparedRecordsInWriter.clear()
+      }
+      workPromise = work(actionInterface(this, workItem))
+      if (!wasInSynchronousAction) {
+        this._inSynchronousAction = false
+      }
 
       if (process.env.NODE_ENV !== 'production') {
         invariant(
@@ -194,12 +298,44 @@ export default class WorkQueue {
         )
       }
 
-      resolve(await workPromise)
+      result = await workPromise
+
+      if (process.env.NODE_ENV !== 'production' && isWriter && !wasInSynchronousAction) {
+        const uncommitted = this._db._preparedRecordsInWriter
+        if (uncommitted.size > 0) {
+          const recordList = Array.from(uncommitted)
+          const debugNames = recordList
+            .slice(0, 5)
+            .map((r: Model) => r.__debugName)
+            .join(', ')
+          const more = uncommitted.size > 5 ? ` (and ${uncommitted.size - 5} more)` : ''
+          logger.warn(
+            `Prepared changes were not sent to batch() in writer (${workItem.description ||
+              'unnamed'}): ${debugNames}${more}. ` +
+              `Use database.batch() to commit prepared changes before the writer returns. See docs for more details.`,
+          )
+        }
+      }
     } catch (error) {
-      reject(error)
+      // Ensure the flag is reset even if work throws synchronously or asynchronously
+      this._inSynchronousAction = false
+      caughtError = error
+    } finally {
+      this._workExecutionDepth -= 1
+      // Reset _insideWorkExecution only if this was the outermost work execution
+      // (i.e. don't reset it prematurely when inside a nested subAction)
+      if (this._workExecutionDepth === 0) {
+        this._insideWorkExecution = false
+      }
     }
 
     this._queue.shift()
+
+    if (caughtError) {
+      reject(caughtError)
+    } else {
+      resolve(result)
+    }
 
     if (this._queue.length) {
       setTimeout(() => this._executeNext(), 0)

@@ -67,6 +67,12 @@ export default class Model {
 
   _preparedState: null | 'create' | 'update' | 'markAsDeleted' | 'destroyPermanently' = null
 
+  _preparedStateBeforeBatch: null | 'create' | 'update' | 'markAsDeleted' | 'destroyPermanently' = null
+
+  _rawBeforeChange: ?RawRecord = null
+
+  _statusBeforeChange: ?SyncStatus = null
+
   __changes: ?BehaviorSubject<$FlowFixMe<this>> = null
 
   _getChanges(): BehaviorSubject<$FlowFixMe<this>> {
@@ -122,41 +128,31 @@ export default class Model {
    * @see {Model#update}
    * @see {Database#batch}
    */
+  __warnIfNotBatchedSynchronously(_preparedState: string, _methodName: string): void {
+    if (process.env.NODE_ENV !== 'production' && this.db._workQueue.isWriterRunning) {
+      this.db._preparedRecordsInWriter.add(this)
+    }
+  }
+
   prepareUpdate(recordUpdater: (this) => void = noop): this {
     invariant(
       !this._preparedState,
       `Cannot update a record with pending changes (${this.__debugName})`,
     )
     this.__ensureNotDisposable(`Model.prepareUpdate()`)
+    // $FlowFixMe
+    this._rawBeforeChange = ({ ...this._raw }: any)
     this._isEditing = true
 
-    // Touch updatedAt (if available)
     if ('updatedAt' in this) {
       this._setRaw(columnName('updated_at'), Date.now())
     }
 
-    // Perform updates
     ensureSync(recordUpdater(this))
     this._isEditing = false
     this._preparedState = 'update'
 
-    // TODO: `process.nextTick` doesn't work on React Native
-    // We could polyfill with setImmediate, but it doesn't have the same effect — test and enseure
-    // it would actually work for this purpose
-    // TODO: Also add to other prepared changes
-    if (
-      process.env.NODE_ENV !== 'production' &&
-      typeof process !== 'undefined' &&
-      process &&
-      process.nextTick
-    ) {
-      process.nextTick(() => {
-        invariant(
-          this._preparedState !== 'update',
-          `record.prepareUpdate was called on ${this.__debugName} but wasn't sent to batch() synchronously -- this is bad!`,
-        )
-      })
-    }
+    this.__warnIfNotBatchedSynchronously('update', 'prepareUpdate')
     this.__logVerbose('prepareUpdate')
 
     return this
@@ -187,8 +183,10 @@ export default class Model {
       `Cannot mark a record with pending changes as deleted (${this.__debugName})`,
     )
     this.__ensureNotDisposable(`Model.prepareMarkAsDeleted()`)
+    this._statusBeforeChange = this._raw._status
     this._raw._status = 'deleted'
     this._preparedState = 'markAsDeleted'
+    this.__warnIfNotBatchedSynchronously('markAsDeleted', 'prepareMarkAsDeleted')
     this.__logVerbose('prepareMarkAsDeleted')
     return this
   }
@@ -222,8 +220,10 @@ export default class Model {
       `Cannot destroy permanently record with pending changes (${this.__debugName})`,
     )
     this.__ensureNotDisposable(`Model.prepareDestroyPermanently()`)
+    this._statusBeforeChange = this._raw._status
     this._raw._status = 'deleted'
     this._preparedState = 'destroyPermanently'
+    this.__warnIfNotBatchedSynchronously('destroyPermanently', 'prepareDestroyPermanently')
     this.__logVerbose('prepareDestroyPermanently')
     return this
   }
@@ -371,6 +371,7 @@ export default class Model {
     ensureSync(recordBuilder(record))
     record._isEditing = false
 
+    record.__warnIfNotBatchedSynchronously('create', 'prepareCreate')
     record.__logVerbose('prepareCreate')
 
     return record
@@ -382,6 +383,7 @@ export default class Model {
   ): this {
     const record = new this(collection, sanitizedRaw(dirtyRaw, collection.schema))
     record._preparedState = 'create'
+    record.__warnIfNotBatchedSynchronously('create', 'prepareCreateFromDirtyRaw')
     record.__logVerbose('prepareCreateFromDirtyRaw')
     return record
   }
@@ -484,5 +486,31 @@ export default class Model {
     if (this.db.experimentalIsVerbose) {
       logger.debug(`${debugName}: ${this.__debugName}`)
     }
+  }
+
+  _revertPreparedChanges(): void {
+    // Note: _preparedState may have already been cleared by batch() in the synchronous phase.
+    // We use _preparedStateBeforeBatch (if available) to know what state to restore.
+    const preparedState = this._preparedStateBeforeBatch || this._preparedState
+    if (!preparedState) {
+      return
+    }
+
+    if (preparedState === 'update') {
+      if (this._rawBeforeChange) {
+        this._raw = this._rawBeforeChange
+      }
+    } else if (preparedState === 'markAsDeleted' || preparedState === 'destroyPermanently') {
+      if (this._statusBeforeChange) {
+        this._raw._status = this._statusBeforeChange
+      }
+    }
+
+    // Restore _preparedState so the record can be retried in a subsequent batch() call.
+    this._preparedState = preparedState
+
+    this._rawBeforeChange = null
+    this._statusBeforeChange = null
+    this._preparedStateBeforeBatch = null
   }
 }

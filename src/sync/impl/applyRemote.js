@@ -262,8 +262,8 @@ function prepareApplyRemoteChangesToCollection<T: Model>(
   recordsToApply: RecordsToApplyRemoteChangesTo<T>,
   collection: Collection<T>,
   context: ApplyRemoteChangesContext,
-): Array<?T> {
-  const { db, sendCreatedAsUpdated, log, conflictResolver } = context
+): [Array<?T>, RecordId[]] {
+  const { sendCreatedAsUpdated, log, conflictResolver } = context
   const { table } = collection
   const {
     created,
@@ -282,6 +282,7 @@ function prepareApplyRemoteChangesToCollection<T: Model>(
   }
 
   const recordsToBatch: Array<?T> = [] // mutating - perf critical
+  const deletedRecordsToDestroyImmediately: RecordId[] = []
 
   // Insert and update records
   created.forEach((raw) => {
@@ -298,8 +299,7 @@ function prepareApplyRemoteChangesToCollection<T: Model>(
       logError(
         `[Sync] Server wants client to create record ${table}#${raw.id}, but it already exists locally and is marked as deleted. This may suggest last sync partially executed, and then failed; or it could be a serious bug. Will delete local record and recreate it instead.`,
       )
-      // Note: we're not awaiting the async operation (but it will always complete before the batch)
-      db.adapter.destroyDeletedRecords(table, [raw.id])
+      deletedRecordsToDestroyImmediately.push(raw.id)
       recordsToBatch.push(prepareCreateFromRaw(collection, raw))
     } else {
       recordsToBatch.push(prepareCreateFromRaw(collection, raw))
@@ -332,33 +332,36 @@ function prepareApplyRemoteChangesToCollection<T: Model>(
     recordsToBatch.push(record.prepareDestroyPermanently())
   })
 
-  return recordsToBatch
+  return [recordsToBatch, deletedRecordsToDestroyImmediately]
 }
 
 const destroyAllDeletedRecords = async (
   db: Database,
   recordsToApply: AllRecordsToApply,
+  extraDeletedRecords: { [TableName<any>]: RecordId[] },
 ): Promise<void> => {
-  const promises = toPairs(recordsToApply).map(([tableName, { deletedRecordsToDestroy }]) =>
-    deletedRecordsToDestroy.length
-      ? db.adapter.destroyDeletedRecords((tableName: any), deletedRecordsToDestroy)
-      : null,
-  )
+  const promises = toPairs(recordsToApply).map(([tableName, { deletedRecordsToDestroy }]) => {
+    const extra = extraDeletedRecords[(tableName: any)] || []
+    const allToDestroy = deletedRecordsToDestroy.concat(extra)
+    return allToDestroy.length
+      ? db.adapter.destroyDeletedRecords((tableName: any), allToDestroy)
+      : null
+  })
   await Promise.all(promises)
 }
 
 const applyAllRemoteChanges = async (
   recordsToApply: AllRecordsToApply,
   context: ApplyRemoteChangesContext,
+  preparedBatches: { [TableName<any>]: Array<?Model> },
 ): Promise<void> => {
   const { db } = context
   const allRecords: Array<?Model> = []
-  toPairs(recordsToApply).forEach(([tableName, records]) => {
-    prepareApplyRemoteChangesToCollection(records, db.get((tableName: any)), context).forEach(
-      (record) => {
-        allRecords.push(record)
-      },
-    )
+  toPairs(recordsToApply).forEach(([tableName]) => {
+    const preparedModels = preparedBatches[(tableName: any)]
+    preparedModels.forEach((record) => {
+      allRecords.push(record)
+    })
   })
   // $FlowFixMe
   await db.batch(allRecords)
@@ -368,15 +371,12 @@ const applyAllRemoteChanges = async (
 const unsafeApplyAllRemoteChangesByBatches = async (
   recordsToApply: AllRecordsToApply,
   context: ApplyRemoteChangesContext,
+  preparedBatches: { [TableName<any>]: Array<?Model> },
 ): Promise<void> => {
   const { db } = context
   const promises = []
-  toPairs(recordsToApply).forEach(([tableName, records]) => {
-    const preparedModels: Array<?Model> = prepareApplyRemoteChangesToCollection(
-      records,
-      db.get((tableName: any)),
-      context,
-    )
+  toPairs(recordsToApply).forEach(([tableName]) => {
+    const preparedModels: Array<?Model> = preparedBatches[(tableName: any)]
     splitEvery(5000, preparedModels).forEach((recordBatch) => {
       promises.push(db.batch(recordBatch))
     })
@@ -392,11 +392,27 @@ export default async function applyRemoteChanges(
 
   const recordsToApply = await getAllRecordsToApply(remoteChanges, context)
 
-  // Perform steps concurrently
-  await Promise.all([
-    destroyAllDeletedRecords(db, recordsToApply),
-    _unsafeBatchPerCollection
-      ? unsafeApplyAllRemoteChangesByBatches(recordsToApply, context)
-      : applyAllRemoteChanges(recordsToApply, context),
-  ])
+  // First pass: prepare all batches and collect records that need immediate destroyDeletedRecords
+  const preparedBatches: { [TableName<any>]: Array<?Model> } = {}
+  const extraDeletedRecords: { [TableName<any>]: RecordId[] } = {}
+  toPairs(recordsToApply).forEach(([tableName, records]) => {
+    const [batch, extraDeletes] = prepareApplyRemoteChangesToCollection(
+      records,
+      db.get((tableName: any)),
+      context,
+    )
+    preparedBatches[(tableName: any)] = batch
+    if (extraDeletes.length) {
+      extraDeletedRecords[(tableName: any)] = extraDeletes
+    }
+  })
+
+  // Must destroy deleted records BEFORE applying remote changes (serialized, not parallel)
+  // Otherwise create for same ID could race with destroyDeletedRecords and get deleted again
+  await destroyAllDeletedRecords(db, recordsToApply, extraDeletedRecords)
+
+  // Now apply the remote changes
+  await (_unsafeBatchPerCollection
+    ? unsafeApplyAllRemoteChangesByBatches(recordsToApply, context, preparedBatches)
+    : applyAllRemoteChanges(recordsToApply, context, preparedBatches))
 }

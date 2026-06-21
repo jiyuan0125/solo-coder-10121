@@ -107,6 +107,7 @@ export default class Database {
     // performance critical - using mutations
     const batchOperations: BatchOperation[] = []
     const changeNotifications: { [TableName<any>]: CollectionChangeSet<Model> } = {}
+    const recordsToProcess: Model[] = []
     actualRecords.forEach((record) => {
       if (!record) {
         return
@@ -117,6 +118,8 @@ export default class Database {
         invariant(record._raw._status !== 'disposable', `Cannot batch a disposable record`)
         throw new Error(`Cannot batch a record that doesn't have a prepared create/update/delete`)
       }
+
+      recordsToProcess.push(record)
 
       const raw = record._raw
       const { id } = raw // faster than Model.id
@@ -140,20 +143,29 @@ export default class Database {
         invariant(false, 'bad preparedState')
       }
 
-      if (preparedState !== 'create') {
-        // We're (unsafely) assuming that batch will succeed and removing the "pending" state so that
-        // subsequent changes to the record don't trip up the invariant
-        // TODO: What if this fails?
-        record._preparedState = null
-      }
-
       if (!changeNotifications[table]) {
         changeNotifications[table] = []
       }
       changeNotifications[table].push({ record, type: changeType })
     })
 
-    await this.adapter.batch(batchOperations)
+    // NOTE: We clear _preparedState BEFORE awaiting adapter.batch(). This ensures that the
+    // record appears "clean" (no pending changes) synchronously after batch() is called,
+    // matching the original API contract. If adapter.batch() fails, _revertPreparedChanges()
+    // will restore both the raw data AND the _preparedState so the record can be retried.
+    recordsToProcess.forEach((record) => {
+      record._preparedStateBeforeBatch = record._preparedState
+      record._preparedState = null
+    })
+
+    try {
+      await this.adapter.batch(batchOperations)
+    } catch (error) {
+      recordsToProcess.forEach((record) => {
+        record._revertPreparedChanges()
+      })
+      throw error
+    }
 
     // Debug info
     if (this.experimentalIsVerbose) {
@@ -188,12 +200,13 @@ export default class Database {
     return undefined // shuts up flow
   }
 
-  _pendingNotificationBatches: number = 0
-  _pendingNotificationChanges: [TableName<any>, CollectionChangeSet<any>][][] = []
+  _notificationBatchStack: [TableName<any>, CollectionChangeSet<any>][][][] = []
+
+  _preparedRecordsInWriter: Set<Model> = new Set()
 
   _notify(changes: [TableName<any>, CollectionChangeSet<any>][]): void {
-    if (this._pendingNotificationBatches > 0) {
-      this._pendingNotificationChanges.push(changes)
+    if (this._notificationBatchStack.length > 0) {
+      this._notificationBatchStack[this._notificationBatchStack.length - 1].push(changes)
       return
     }
 
@@ -217,18 +230,35 @@ export default class Database {
 
   async experimentalBatchNotifications<T>(work: () => Promise<T>): Promise<T> {
     // TODO: Document & add tests if this proves useful
+    this._notificationBatchStack.push([])
     try {
-      this._pendingNotificationBatches += 1
       const result = await work()
+      this._commitNotificationBatch()
       return result
-    } finally {
-      this._pendingNotificationBatches -= 1
-      if (this._pendingNotificationBatches === 0) {
-        const changes = this._pendingNotificationChanges
-        this._pendingNotificationChanges = []
-        changes.forEach((_changes) => this._notify(_changes))
-      }
+    } catch (error) {
+      this._discardNotificationBatch()
+      throw error
     }
+  }
+
+  _commitNotificationBatch(): void {
+    const currentBatch = this._notificationBatchStack.pop()
+    if (!currentBatch) {
+      return
+    }
+
+    if (this._notificationBatchStack.length === 0) {
+      currentBatch.forEach((changes) => {
+        this._notify(changes)
+      })
+    } else {
+      const parentBatch = this._notificationBatchStack[this._notificationBatchStack.length - 1]
+      ;(parentBatch: any).push(...currentBatch)
+    }
+  }
+
+  _discardNotificationBatch(): void {
+    this._notificationBatchStack.pop()
   }
 
   /**

@@ -244,8 +244,15 @@ export default class Collection<Record: Model> {
       if (type === 'created') {
         record._preparedState = null
         this._cache.add(record)
+      } else if (type === 'updated') {
+        record._preparedState = null
       } else if (type === 'destroyed') {
+        record._preparedState = null
         this._cache.delete(record)
+      }
+
+      if (process.env.NODE_ENV !== 'production') {
+        this.database._preparedRecordsInWriter.delete(record)
       }
     })
   }
