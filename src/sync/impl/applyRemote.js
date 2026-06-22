@@ -340,14 +340,28 @@ const destroyAllDeletedRecords = async (
   recordsToApply: AllRecordsToApply,
   extraDeletedRecords: { [TableName<any>]: RecordId[] },
 ): Promise<void> => {
-  const promises = toPairs(recordsToApply).map(([tableName, { deletedRecordsToDestroy }]) => {
+  const entries = toPairs(recordsToApply)
+  const failedTables: TableName<any>[] = []
+  for (let i = 0; i < entries.length; i++) {
+    const [tableName, { deletedRecordsToDestroy }] = entries[i]
     const extra = extraDeletedRecords[(tableName: any)] || []
     const allToDestroy = deletedRecordsToDestroy.concat(extra)
-    return allToDestroy.length
-      ? db.adapter.destroyDeletedRecords((tableName: any), allToDestroy)
-      : null
-  })
-  await Promise.all(promises)
+    if (allToDestroy.length) {
+      try {
+        await db.adapter.destroyDeletedRecords((tableName: any), allToDestroy)
+      } catch (error) {
+        logger.warn(
+          `[Sync] destroyDeletedRecords failed for table ${tableName}. Already-destroyed records in other tables are preserved. Failed table will be retried on next sync.`,
+        )
+        failedTables.push((tableName: any))
+      }
+    }
+  }
+  if (failedTables.length) {
+    throw new Error(
+      `[Sync] destroyDeletedRecords failed for tables: ${failedTables.join(', ')}. Partial destruction may have occurred; retry recommended.`,
+    )
+  }
 }
 
 const applyAllRemoteChanges = async (
@@ -390,29 +404,27 @@ export default async function applyRemoteChanges(
 ): Promise<void> {
   const { db, _unsafeBatchPerCollection } = context
 
-  const recordsToApply = await getAllRecordsToApply(remoteChanges, context)
+  const recordsToApply = await db.experimentalBatchNotifications(async () => {
+    const snapshot = await getAllRecordsToApply(remoteChanges, context)
 
-  // First pass: prepare all batches and collect records that need immediate destroyDeletedRecords
-  const preparedBatches: { [TableName<any>]: Array<?Model> } = {}
-  const extraDeletedRecords: { [TableName<any>]: RecordId[] } = {}
-  toPairs(recordsToApply).forEach(([tableName, records]) => {
-    const [batch, extraDeletes] = prepareApplyRemoteChangesToCollection(
-      records,
-      db.get((tableName: any)),
-      context,
-    )
-    preparedBatches[(tableName: any)] = batch
-    if (extraDeletes.length) {
-      extraDeletedRecords[(tableName: any)] = extraDeletes
-    }
+    const preparedBatches: { [TableName<any>]: Array<?Model> } = {}
+    const extraDeletedRecords: { [TableName<any>]: RecordId[] } = {}
+    toPairs(snapshot).forEach(([tableName, records]) => {
+      const [batch, extraDeletes] = prepareApplyRemoteChangesToCollection(
+        records,
+        db.get((tableName: any)),
+        context,
+      )
+      preparedBatches[(tableName: any)] = batch
+      if (extraDeletes.length) {
+        extraDeletedRecords[(tableName: any)] = extraDeletes
+      }
+    })
+
+    await destroyAllDeletedRecords(db, snapshot, extraDeletedRecords)
+
+    await (_unsafeBatchPerCollection
+      ? unsafeApplyAllRemoteChangesByBatches(snapshot, context, preparedBatches)
+      : applyAllRemoteChanges(snapshot, context, preparedBatches))
   })
-
-  // Must destroy deleted records BEFORE applying remote changes (serialized, not parallel)
-  // Otherwise create for same ID could race with destroyDeletedRecords and get deleted again
-  await destroyAllDeletedRecords(db, recordsToApply, extraDeletedRecords)
-
-  // Now apply the remote changes
-  await (_unsafeBatchPerCollection
-    ? unsafeApplyAllRemoteChangesByBatches(recordsToApply, context, preparedBatches)
-    : applyAllRemoteChanges(recordsToApply, context, preparedBatches))
 }

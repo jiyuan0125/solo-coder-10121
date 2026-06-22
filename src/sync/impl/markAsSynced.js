@@ -1,7 +1,7 @@
 // @flow
 
 import areRecordsEqual from '../../utils/fp/areRecordsEqual'
-import { logError } from '../../utils/common'
+import { logError, logger } from '../../utils/common'
 import type { Database, Model, TableName } from '../..'
 
 import { prepareMarkAsSynced } from './helpers'
@@ -35,17 +35,29 @@ const recordsToMarkAsSynced = (
   return syncedRecords
 }
 
-const destroyDeletedRecords = (
+const destroyDeletedRecordsPerCollection = async (
   db: Database,
   { changes }: SyncLocalChanges,
   allRejectedIds: SyncRejectedIds,
-): Promise<any>[] =>
-  Object.keys(changes).map((_tableName) => {
+): Promise<void> => {
+  const tableNames = Object.keys(changes)
+  for (let i = 0; i < tableNames.length; i++) {
+    const _tableName = tableNames[i]
     const tableName: TableName<any> = (_tableName: any)
     const rejectedIds = new Set(allRejectedIds[tableName])
     const deleted = changes[tableName].deleted.filter((id) => !rejectedIds.has(id))
-    return deleted.length ? db.adapter.destroyDeletedRecords(tableName, deleted) : Promise.resolve()
-  })
+    if (deleted.length) {
+      try {
+        await db.adapter.destroyDeletedRecords(tableName, deleted)
+      } catch (error) {
+        logger.warn(
+          `[Sync] destroyDeletedRecords failed for table ${tableName}. Records that were not destroyed will remain in deleted state and be retried on next sync.`,
+        )
+        throw error
+      }
+    }
+  }
+}
 
 export default function markLocalChangesAsSynced(
   db: Database,
@@ -53,11 +65,11 @@ export default function markLocalChangesAsSynced(
   rejectedIds?: ?SyncRejectedIds,
 ): Promise<void> {
   return db.write(async () => {
-    // Must destroy deleted records BEFORE marking records as synced (serialized, not parallel)
-    // Otherwise a race condition can cause inconsistent state
-    await Promise.all(destroyDeletedRecords(db, syncedLocalChanges, rejectedIds || {}))
-    await db.batch(
-      recordsToMarkAsSynced(syncedLocalChanges, rejectedIds || {}).map(prepareMarkAsSynced),
-    )
+    await db.experimentalBatchNotifications(async () => {
+      await destroyDeletedRecordsPerCollection(db, syncedLocalChanges, rejectedIds || {})
+      await db.batch(
+        recordsToMarkAsSynced(syncedLocalChanges, rejectedIds || {}).map(prepareMarkAsSynced),
+      )
+    })
   }, 'sync-markLocalChangesAsSynced')
 }

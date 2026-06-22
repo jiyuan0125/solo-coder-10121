@@ -373,17 +373,20 @@ export default class Database {
     this._ensureInWriter(`Database.unsafeResetDatabase()`)
     try {
       this._isBeingReset = true
-      // First kill actions, to ensure no more traffic to adapter happens
       this._workQueue._abortPendingWork()
 
-      // Kill ability to call adapter methods during reset (to catch bugs if someone does this)
+      this._notificationBatchStack = []
+      this._preparedRecordsInWriter = new Set()
+      this._workQueue._subActionIncoming = false
+      this._workQueue._inSynchronousAction = false
+      this._workQueue._insideWorkExecution = false
+      this._workQueue._workExecutionDepth = 0
+
       const { adapter } = this
       const ErrorAdapter = require('../adapters/error').default
       this.adapter = (new ErrorAdapter(): any)
 
-      // Check for illegal subscribers
       if (this._subscribers.length) {
-        // TODO: This should be an error, not a console.log, but actually useful diagnostics are necessary for this to work, otherwise people will be confused
         // eslint-disable-next-line no-console
         console.log(
           `Application error! Unexpected ${this._subscribers.length} Database subscribers were detected during database.unsafeResetDatabase() call. App should not hold onto subscriptions or Watermelon objects while resetting database.`,
@@ -393,16 +396,13 @@ export default class Database {
         this._subscribers = []
       }
 
-      // Clear the database
       await adapter.unsafeResetDatabase()
 
-      // Only now clear caches, since there may have been queued fetches from DB still bringing in items to cache
       Object.values(this.collections.map).forEach((collection) => {
         // $FlowFixMe
         collection._cache.unsafeClear()
       })
 
-      // Restore working Database
       this._resetCount += 1
       this.adapter = adapter
     } finally {

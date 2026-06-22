@@ -123,7 +123,6 @@ export default class WorkQueue {
     description: ?string,
     isWriter: boolean,
   ): Promise<T> {
-    // If a subAction was scheduled using subAction(), database.write/read() calls skip the line
     if (this._subActionIncoming) {
       this._subActionIncoming = false
       const currentWork = this._queue[0]
@@ -135,9 +134,15 @@ export default class WorkQueue {
             'See docs for more details.',
         )
       }
-      // Track execution depth for nested subActions as well
       this._workExecutionDepth += 1
       const wasInsideWorkExecution = this._insideWorkExecution
+      const savedPreparedRecords =
+        process.env.NODE_ENV !== 'production' && isWriter
+          ? new Set(this._db._preparedRecordsInWriter)
+          : null
+      if (process.env.NODE_ENV !== 'production' && isWriter) {
+        this._db._preparedRecordsInWriter.clear()
+      }
       this._insideWorkExecution = true
       try {
         const result = work(actionInterface(this, currentWork))
@@ -158,6 +163,9 @@ export default class WorkQueue {
         this._workExecutionDepth -= 1
         if (this._workExecutionDepth === 0) {
           this._insideWorkExecution = wasInsideWorkExecution
+        }
+        if (savedPreparedRecords !== null) {
+          this._db._preparedRecordsInWriter = savedPreparedRecords
         }
         throw error
       }
@@ -263,19 +271,13 @@ export default class WorkQueue {
     let workPromise
     let result
     let caughtError
+    let wasInSynchronousAction = false
     try {
-      // Mark that we're in the synchronous execution phase of a work item
-      // This is used to detect illegal nested writer/reader calls
-      // Only set if not already set (i.e. we're the top-level work, not a subAction)
-      const wasInSynchronousAction = this._inSynchronousAction
+      wasInSynchronousAction = this._inSynchronousAction
       if (!wasInSynchronousAction) {
         this._inSynchronousAction = true
       }
-      // Increment work execution depth (including for subActions)
-      // This tracks whether we're inside any work() function at all
       this._workExecutionDepth += 1
-      // Mark that we're about to execute inside a work function body
-      // This is used together with _inSynchronousAction to detect illegal nested calls
       this._insideWorkExecution = true
       if (process.env.NODE_ENV !== 'production' && isWriter && !wasInSynchronousAction) {
         this._db._preparedRecordsInWriter.clear()
@@ -317,13 +319,13 @@ export default class WorkQueue {
         }
       }
     } catch (error) {
-      // Ensure the flag is reset even if work throws synchronously or asynchronously
-      this._inSynchronousAction = false
+      this._inSynchronousAction = wasInSynchronousAction
+      if (process.env.NODE_ENV !== 'production' && isWriter) {
+        this._db._preparedRecordsInWriter.clear()
+      }
       caughtError = error
     } finally {
       this._workExecutionDepth -= 1
-      // Reset _insideWorkExecution only if this was the outermost work execution
-      // (i.e. don't reset it prematurely when inside a nested subAction)
       if (this._workExecutionDepth === 0) {
         this._insideWorkExecution = false
       }
