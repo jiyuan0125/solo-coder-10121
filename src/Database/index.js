@@ -149,6 +149,20 @@ export default class Database {
       changeNotifications[table].push({ record, type: changeType })
     })
 
+    // Detect records that were prepared in a different synchronous segment (crossed await boundary)
+    // Must do this in the sync phase before awaiting adapter.batch()
+    if (process.env.NODE_ENV !== 'production') {
+      const currentGen = this._workQueue._syncGeneration
+      recordsToProcess.forEach((record) => {
+        if (
+          record._preparedSyncGeneration !== null &&
+          record._preparedSyncGeneration !== currentGen
+        ) {
+          this._preparedAcrossAwaitBoundary.add(record)
+        }
+      })
+    }
+
     // NOTE: We clear _preparedState BEFORE awaiting adapter.batch(). This ensures that the
     // record appears "clean" (no pending changes) synchronously after batch() is called,
     // matching the original API contract. If adapter.batch() fails, _revertPreparedChanges()
@@ -203,6 +217,7 @@ export default class Database {
   _notificationBatchStack: [TableName<any>, CollectionChangeSet<any>][][][] = []
 
   _preparedRecordsInWriter: Set<Model> = new Set()
+  _preparedAcrossAwaitBoundary: Set<Model> = new Set()
 
   _notify(changes: [TableName<any>, CollectionChangeSet<any>][]): void {
     if (this._notificationBatchStack.length > 0) {
@@ -377,7 +392,10 @@ export default class Database {
 
       this._notificationBatchStack = []
       this._preparedRecordsInWriter = new Set()
+      this._preparedAcrossAwaitBoundary = new Set()
       this._workQueue._subActionIncoming = false
+      this._workQueue._syncGeneration = 0
+      this._workQueue._syncGenBumpScheduled = false
       this._workQueue._inSynchronousAction = false
       this._workQueue._insideWorkExecution = false
       this._workQueue._workExecutionDepth = 0

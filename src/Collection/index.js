@@ -253,6 +253,7 @@ export default class Collection<Record: Model> {
 
       if (process.env.NODE_ENV !== 'production') {
         this.database._preparedRecordsInWriter.delete(record)
+        record._preparedSyncGeneration = null
       }
     })
   }

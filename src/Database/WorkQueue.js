@@ -109,6 +109,32 @@ export default class WorkQueue {
   // external code that happens to run while a work item is pending in the queue
   _insideWorkExecution: boolean = false
 
+  // Incrementing counter that identifies the current synchronous execution segment.
+  // Each time we cross an await boundary (when the microtask queue is flushed), this
+  // counter is bumped. Used to detect if prepare and batch happened in the same sync
+  // segment or if there was an await in between.
+  _syncGeneration: number = 0
+
+  _syncGenBumpScheduled: boolean = false
+
+  _ensureSyncGenBumpScheduled(): void {
+    if (!this._syncGenBumpScheduled) {
+      this._syncGenBumpScheduled = true
+      // Use queueMicrotask to bump the generation after the current synchronous
+      // execution segment finishes. This means all prepare() calls within the same
+      // synchronous segment will share the same _syncGeneration value.
+      const bump = () => {
+        this._syncGeneration += 1
+        this._syncGenBumpScheduled = false
+      }
+      if (typeof queueMicrotask === 'function') {
+        queueMicrotask(bump)
+      } else {
+        Promise.resolve().then(bump)
+      }
+    }
+  }
+
   constructor(db: Database): void {
     this._db = db
   }
@@ -140,8 +166,13 @@ export default class WorkQueue {
         process.env.NODE_ENV !== 'production' && isWriter
           ? new Set(this._db._preparedRecordsInWriter)
           : null
+      const savedPreparedAcrossAwait =
+        process.env.NODE_ENV !== 'production' && isWriter
+          ? new Set(this._db._preparedAcrossAwaitBoundary)
+          : null
       if (process.env.NODE_ENV !== 'production' && isWriter) {
         this._db._preparedRecordsInWriter.clear()
+        this._db._preparedAcrossAwaitBoundary.clear()
       }
       this._insideWorkExecution = true
       try {
@@ -166,6 +197,9 @@ export default class WorkQueue {
         }
         if (savedPreparedRecords !== null) {
           this._db._preparedRecordsInWriter = savedPreparedRecords
+        }
+        if (savedPreparedAcrossAwait !== null) {
+          this._db._preparedAcrossAwaitBoundary = savedPreparedAcrossAwait
         }
         throw error
       }
@@ -281,6 +315,7 @@ export default class WorkQueue {
       this._insideWorkExecution = true
       if (process.env.NODE_ENV !== 'production' && isWriter && !wasInSynchronousAction) {
         this._db._preparedRecordsInWriter.clear()
+        this._db._preparedAcrossAwaitBoundary.clear()
       }
       workPromise = work(actionInterface(this, workItem))
       if (!wasInSynchronousAction) {
@@ -317,11 +352,31 @@ export default class WorkQueue {
               `Use database.batch() to commit prepared changes before the writer returns. See docs for more details.`,
           )
         }
+
+        const acrossAwaitBoundary = this._db._preparedAcrossAwaitBoundary
+        if (acrossAwaitBoundary.size > 0) {
+          const recordList = Array.from(acrossAwaitBoundary)
+          const debugNames = recordList
+            .slice(0, 5)
+            .map((r: Model) => r.__debugName)
+            .join(', ')
+          const more = acrossAwaitBoundary.size > 5
+            ? ` (and ${acrossAwaitBoundary.size - 5} more)`
+            : ''
+          logger.warn(
+            `Prepared changes were batched after an await boundary in writer (${workItem.description ||
+              'unnamed'}): ${debugNames}${more}. ` +
+              `Prepared records must be passed to database.batch() synchronously (before any await). ` +
+              `Batching after an await is unsafe because other writers may have modified records in the meantime. ` +
+              `See docs for more details.`,
+          )
+        }
       }
     } catch (error) {
       this._inSynchronousAction = wasInSynchronousAction
       if (process.env.NODE_ENV !== 'production' && isWriter) {
         this._db._preparedRecordsInWriter.clear()
+        this._db._preparedAcrossAwaitBoundary.clear()
       }
       caughtError = error
     } finally {

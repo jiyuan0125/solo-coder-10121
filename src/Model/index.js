@@ -67,6 +67,8 @@ export default class Model {
 
   _preparedState: null | 'create' | 'update' | 'markAsDeleted' | 'destroyPermanently' = null
 
+  _preparedSyncGeneration: ?number = null
+
   _preparedStateBeforeBatch: null | 'create' | 'update' | 'markAsDeleted' | 'destroyPermanently' = null
 
   _rawBeforeChange: ?RawRecord = null
@@ -131,6 +133,8 @@ export default class Model {
   __warnIfNotBatchedSynchronously(_preparedState: string, _methodName: string): void {
     if (process.env.NODE_ENV !== 'production' && this.db._workQueue.isWriterRunning) {
       this.db._preparedRecordsInWriter.add(this)
+      this.db._workQueue._ensureSyncGenBumpScheduled()
+      this._preparedSyncGeneration = this.db._workQueue._syncGeneration
     }
   }
 
